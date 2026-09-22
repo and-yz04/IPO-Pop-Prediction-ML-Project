@@ -1,0 +1,58 @@
+---
+title: "Data Memo: Predicting IPO First-Day \"Pops\""
+author: "Andy"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview of Dataset
+
+For my final project, I plan to work with a dataset of U.S. initial public offerings (IPOs) where each observation is a single company's IPO event. Since each row represents a different company going public the observations can reasonably be treated as independent of one another.
+
+**Source:** I will be usingthe "Stocks IPO information & results" dataset available on Kaggle and IPOs along with post-listing performance information. Link: https://www.kaggle.com/datasets/proselotis/financial-ipo-data. Using a single pre-packaged file avoids the data-merging issues I ran into with my first data memo.
+
+**What it includes:** For each IPO, the dataset includes company/ticker identifiers, IPO date, offer price, opening price, industry/sector classification, number of shares offered, and price performance at several points after listing.
+
+**Observations & predictors:** I expect somewhere on the order of 1,000+ IPO observations, with roughly 8-12 usable predictor variables once I finalize which columns to keep. I will exclude any post-outcome performance columns from the predictor set because those would leak information about the very outcome I'm trying to predict.
+
+**Variable types:** The response variable will be categorical using binary "Pop" vs. "No Pop". Predictors will include continuous variables like offer price, opening price, shares offered and categorical variables like sector/industry.
+
+**Missing data:** I expect some incompleteness in sector labels or share counts for smaller or older IPOs. I will report the amount and pattern of missing data during EDA. For predictors with a small amount of missingness I'll use median/mode imputation. Also if any column is missing too frequently to be reliable I'll drop it rather than use it heavily.
+
+## Overview of Research Question(s)
+
+**Research question:** Can characteristics of an IPO known at or before its listing like offer price, sector, shares offered, and similar company-level features predict whether the stock "pops" or not?
+
+**Response variable:** `pop`, a binary variable I will construct from the offer price and opening/first-day price columns, coded as "Pop" if the first-day return exceeds a threshold determined during EDA and "No Pop".
+
+**Classification vs. regression:** This is a classification problem, since the outcome is a binary label. I'm using the "pop vs. no pop" rather than predicting the exact percentage return because it is a cleaner amd more decision-relevant question and fits squarely within a standard binary classification workflow.
+
+**Predictors I expect to be useful:** I anticipate that sector/industry and offer price relative to the sector's typical range will carry meaningful signal, since "hot" sectors have historically seen larger first-day pops. Shares offered may also matter since smaller more scarce offerings tend to see more dramatic first-day price moves due to limited supply.
+
+**Goal of the model:** My main goal is predictive and building a classifier that generalizes well to IPOs it hasn't seen. They will be evaluated with standard classification metrics like accuracy, ROC-AUC, and precision/recall. I also want to explore which features carry the most weight via variable importance since that connects to the broader finance literature on IPO underpricing.
+
+## Proposed Project Timeline
+
+
+- **Week 4** Download and load the dataset, confirm column definitions, and build the codebook. Submit this data memo.
+ Clean the data, engineer the binary `pop` response variable, handle missing data, and encode categorical predictors. Begin EDA (class balance, distributions, correlations) with at least 3-5 plots/tables. Finish EDA, address class imbalance if present, and set up a stratified train/test split with stratified k-fold cross-validation.
+- **Week 5:** Fit baseline models (logistic regression, LDA/QDA) and evaluate baseline performance. Fit more flexible, tunable models (elastic net, random forest, boosted trees) and tune hyperparameters via cross-validation, plotting tuning results.
+- **Week 6:** Compare all models on the training/CV results, select the best one or two, and evaluate them on the test set.Write up the final report (introduction, EDA, methods, results, conclusion), polish visualizations, and prepare the final .zip submission with codebook.
+
+## Any Questions or Concerns
+
+A few things I anticipate being challenging:
+
+- **Avoiding outcome leakage:** Since this dataset includes post-listing performance at multiple checkpoints, I need to be careful to only use information known at or before the IPO date as predictors, and not accidentally include any post-outcome columns.
+- **Defining "pop":** I need to settle on a defensible threshold for what counts as a "pop".
+- **Class balance:** Depending on the threshold chosen, the classes could end up imbalanced. I'll check this during EDA and use stratified sampling for both the train/test split and cross-validation and consider resampling techniques if the imbalance is severe.

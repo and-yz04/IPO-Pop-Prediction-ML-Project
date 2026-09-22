@@ -1,0 +1,768 @@
+---
+title: "Pstat 131 Final Project: Predicting IPO First-Day \"Pops\""
+author: "Andy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: cosmo
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.align = "center")
+```
+
+# Introduction
+
+## Background
+
+For my project I choose to pick whether an initial public offering (IPO) will "pop".
+An IPO is the first time a private company sells
+shares of stock to the public on an open exchange like the NASDAQ. 
+Before the trading begins, the company and the investment banks that manage the
+offering agree on an offer price which is the price at which shares are
+offered to investors before the stock starts trading. Once the offering
+opens the stock up to the public, the price often moves quickly away
+from that offer price. When a stock's price jumps above its offer
+price on its first day of trading, it has "popped" and
+financial investors refer to this as IPO underpricing:
+the company effectively sold its shares for less than the market was
+immediately willing to pay for them. When the stock instead trades the same price or
+falls below its offer price it means the IPO was valued properly or overvalued.
+
+Predicting whether an IPO will pop is a common question in
+financial economics. Previous research has linked underpricing to factors like
+the company's industry sector, the general condition of the stock market
+leading up to the offering, and things like company age and
+size. For this project I will build a supervised classification model that
+uses only information that would have been known before or at the moment
+a company's shares begin trading like sector, company age, employee count,
+whether the company is U.S.-based, and how the market had been
+trending in the months before the IPO to predict a binary outcome of whether
+ the stock "pop" on its first day of trading or not?
+
+## Why this project
+
+I choose this project because it recently aligns with my internship of financial
+data analyst were I was analyzing market data for an insurance company that insures
+broker-dealers. Broker-Dealers are companies that help investors buy and sell stocks
+basically like a middleman for example Robinhood or Webull. Seeing whether IPO's
+would "pop" or not was interesting to me because usually when an IPO is offered it is
+offered trough an Investment Banker like Morgan Stanley but with the new stock market
+you could buy it through these middleman like Robinhood. I found this to be a useful
+project idea since it is such a new topic and finding out if IPO's would "pop"
+would be beneficial information for these insurance companies since there is more 
+risk now that these middlemen can sell IPO's. 
+
+## Project roadmap
+
+The rest of this report follows the basic ML pipeline. First I
+load and clean the raw IPO data and make the binary response variable
+`pop`. Then I look at the data visually to understand the outcome and
+relationship to the candidate predictors. I then split the data into
+training and testing sets and set up stratified k-fold cross-validation on
+the training set. Nexy fitting and tuneing the  five different types of classification
+models using the same recipe and the same folds. I will then choose the
+best-performing model based on cross-validated ROC AUC, fit it to the full
+training set, and look at its performance one time on the held-out testing
+set.
+
+# Data
+
+## Source and citation
+
+**Source:** "Stocks IPO information & results," Kaggle dataset by user
+`proselotis`. Available at:
+<https://www.kaggle.com/datasets/proselotis/financial-ipo-data>
+
+**Citation:** Proselotis. (2020). *Stocks IPO information & results*
+[Data set]. Kaggle. https://www.kaggle.com/datasets/proselotis/financial-ipo-data
+
+The raw file (`IPODataFull.csv`) contains 3,762 U.S. IPOs listed between
+1996 and 2018 which has one row per company. For each IPO it includes the company's
+sector/industry classification, basic firm characteristics (employee count,
+founding year, CEO/president information), the broader market's trend in
+the months leading up to the listing, and daily open/high/low/close/volume
+trading prices for around 260 trading days following the IPO also alongside
+several outcome measures the original author had already made. The raw file is 
+extremely wide because it includes a full day-by-day price history and a
+large block of line-item financial-statement data for the fiscal year
+before each company's IPO so I will only keep the small subset of columns relevant
+to my project.
+
+## Loading the raw data
+
+```{r load-packages}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(corrplot)
+library(discrim)   
+library(vip)        
+library(kknn)
+library(themis)  
+library(doParallel)
+tidymodels_prefer()
+```
+
+```{r load-data}
+ipo_raw <- read_csv("data/IPODataFull.csv", locale = locale(encoding = "latin1")) %>%
+  clean_names()   # snake_case everything, same as in Homework 5
+
+dim(ipo_raw)
+```
+
+The `clean_names()` function from `janitor` turns every column name into
+`snake_case` so I don't have to remember the exact capitalization later.
+The file is saved in a Latin-1 encoding instead of UTF-8 because some of
+the company names have special characters in them, so I have to tell
+`read_csv()` that or it throws parsing errors. Knitting this chunk also
+gives a "one or more parsing issues" warning. I checked it with
+`problems()` and all of the flagged cells are in the giant block of
+per-industry, pre-IPO financial columns (like a column that's supposed to
+be a boolean flag but sometimes has an actual dollar amount in it
+instead). I don't use any of those columns in the next step, so this
+warning is safe to ignore for this project.
+
+## Selecting and cleaning the variables I need
+
+Out of the ~1,660 raw columns, two of them give me exactly the response
+variable I need `open_day0` and `close_day0`. When I looked closely at
+the raw file I noticed `open_day0` actually acts like the **IPO offer price** 
+instead of the first price that actually got traded. For a lot of
+rows the day's low is actually above `open_day0`, which can only happen
+if the stock started trading above its offer price right away and never
+came back down to it. `close_day0` is just the stock's closing price at
+the end of its first day of trading. Offer price compared to first-day
+close is actually a pretty standard way IPO underpricing gets measured in
+finance research whcih works out well for this project.
+
+For the predictors, I picked variables that describe the company and the
+market conditions of the IPO, and I left out a few of the raw
+columns `market_cap`, `last_sale`, `revenue`, `net_income`, and the raw
+`employees` count because they turned out to be snapshots of the company
+from whenever the dataset was taken in 2020 instead of from the
+actual IPO date. Using those would leak information about the company's
+future into the model.
+
+```{r select-clean}
+ipo <- ipo_raw %>%
+  transmute(
+    symbol             = symbol,
+    ipo_year           = year,
+    sector             = sector,
+    usa_company        = usa_company,
+    employees_grouped  = employees_grouped,
+    year_difference    = year_difference,     # company age (yrs) at IPO
+    ceo_gender         = usable_ceo_gender,
+    market_month_trend  = market_month_trend,   # market return, 1 month before IPO
+    market_3month_trend = market3month_trend,   # market return, 3 months before IPO
+    market_6month_trend = market6month_trend,   # market return, 6 months before IPO
+    market_year_trend   = market_year_trend,    # market return, 1 year before IPO
+    offer_price        = open_day0,
+    close_day0         = close_day0
+  ) %>%
+  mutate(
+    employees_grouped = employees_grouped %>% replace_na("Unknown") %>%
+      na_if("Blank") %>% replace_na("Unknown"),
+    ceo_gender = ceo_gender %>% replace_na("Unknown") %>%
+      recode("Blank" = "Unknown", "unknown" = "Unknown", "andy" = "Unknown"),
+    usa_company = usa_company %>% replace_na("Unknown"),
+    pct_change = (close_day0 - offer_price) / offer_price
+  ) %>%
+  filter(!is.na(offer_price), !is.na(close_day0), offer_price > 0) %>%
+  mutate(
+    sector = str_replace_all(sector, "[^A-Za-z0-9]+", "_"),
+    employees_grouped = str_replace_all(employees_grouped, "[^A-Za-z0-9]+", "_")
+  ) %>%
+  mutate(across(c(sector, usa_company, employees_grouped, ceo_gender), as.factor))
+
+glimpse(ipo)
+```
+
+# Exploratory Data Analysis
+
+## Missing data
+
+```{r missing-data, fig.width=6, fig.height=4}
+missing_summary <- ipo %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = n_missing / nrow(ipo)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+missing_summary
+
+ggplot(missing_summary, aes(x = fct_reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "#e34a33") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Proportion of Missing Values by Column",
+       x = NULL, y = "% missing") +
+  theme_minimal()
+```
+
+`sector` and `year_difference` which are the company age at IPO, are the two predictors
+with real amounts of missing data whcih is around 19% and 20%. This lines up with
+what I said in my data memo could be a risk for smaller or older listings
+where the company's basic info was never fully recorded. I decided not to
+drop either column since 1/5 missing isn't really that bad.
+Instead in the recipe below I add an explicit
+`"unknown"` category for missing `sector` values using `step_unknown()`,
+and use the median for the missing `year_difference` values using
+`step_impute_median()`. I also noticed there were 63 duplicated ticker
+symbols in the raw data, which is probably just a ticker getting reused
+years apart by two different companies. Since each row is still its own
+distinct IPO event with its own date and prices I decided to just leave
+these rows in instead of removing them.
+
+## Defining "pop"
+
+```{r define-pop, fig.width=6, fig.height=4}
+ggplot(ipo, aes(x = pct_change)) +
+  geom_histogram(bins = 60, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = 0.10, linetype = "dashed", color = "firebrick") +
+  coord_cartesian(xlim = c(-0.25, 1)) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "Distribution of First-Day IPO Returns",
+       subtitle = "Dashed line marks the 10% 'pop' threshold used below (x-axis trimmed for readability)",
+       x = "First-day return: (close, day 0 - offer price) / offer price",
+       y = "Number of IPOs") +
+  theme_minimal()
+
+quantile(ipo$pct_change, probs = c(0.5, 0.75, 0.9, 0.95, 0.99), na.rm = TRUE)
+```
+
+The distribution of first-day returns is really right-skewed. The median
+IPO in this dataset only gains about 2% on its first day wuth the top 10%
+gaining 14% or more and a handful of low-priced IPOs gaining several
+hundred percent. I decided to define an IPO as having "popped" if its
+first-day return is over 10%, which is a threshold that roughly
+separates the top ~15% of IPOs from the rest. This is also consistent with 
+the underpricing thresholds I saw used in typical financial data I read for my data memo.
+
+```{r create-outcome}
+ipo <- ipo %>%
+  mutate(pop = if_else(pct_change > 0.10, "Pop", "No_Pop")) %>%
+  mutate(pop = factor(pop, levels = c("Pop", "No_Pop")))
+
+ipo %>% count(pop) %>% mutate(prop = n / sum(n))
+```
+
+As I expected a stock "popping" is the minority class at only around 15%
+of IPOs. This confirms the class-imbalance risk I flagged in my data memo,
+which is why I stratify every split and every resampling fold on `pop`
+below. This is also why I mainly used ROC AUC instead of accuracy since ROC AUC
+is a lot less sensitive to class imbalance.
+
+## Pop rate by sector
+
+```{r eda-sector, fig.width=7, fig.height=5}
+ipo %>%
+  mutate(sector = fct_na_value_to_level(sector, "Unknown")) %>%
+  group_by(sector) %>%
+  filter(n() >= 30) %>%   # only show sectors with a reasonable sample size
+  summarise(pop_rate = mean(pop == "Pop"), n = n()) %>%
+  ggplot(aes(x = fct_reorder(sector, pop_rate), y = pop_rate)) +
+  geom_col(fill = "#2c7fb8") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "First-Day Pop Rate by Sector",
+       subtitle = "Sectors with fewer than 30 IPOs in the data excluded",
+       x = NULL, y = "% of IPOs that popped") +
+  theme_minimal()
+```
+
+There's real spread between sectors here. Technology and Miscellaneous IPOs
+pop about 28% of the time when compared to only about 8% for Finance and 10%
+for Public Utilities. This lines up with the "hot sector" idea from the
+finance data and makes `sector` an actually useful signal for the model.
+
+## Company age and employee count vs. outcome
+
+```{r eda-age-boxplot, fig.width=6, fig.height=4}
+ggplot(ipo, aes(x = pop, y = year_difference, fill = pop)) +
+  geom_boxplot() +
+  coord_cartesian(ylim = c(0, 50)) +
+  scale_fill_manual(values = c("Pop" = "#31a354", "No_Pop" = "#969696")) +
+  labs(title = "Company Age at IPO by Outcome",
+       x = NULL, y = "Years between founding and IPO") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r eda-employees-bar, fig.width=7, fig.height=4}
+ipo %>%
+  mutate(employees_grouped = fct_relevel(employees_grouped,
+           "0_100", "101_500", "501_1000", "1001_5000",
+           "5001_10000", "_10000", "Unknown")) %>%
+  mutate(employees_grouped = fct_recode(employees_grouped,
+           "0-100" = "0_100", "101-500" = "101_500", "501-1,000" = "501_1000",
+           "1,001-5,000" = "1001_5000", "5,001-10,000" = "5001_10000",
+           ">10,000" = "_10000")) %>%
+  group_by(employees_grouped) %>%
+  summarise(pop_rate = mean(pop == "Pop"), n = n()) %>%
+  ggplot(aes(x = employees_grouped, y = pop_rate)) +
+  geom_col(fill = "#2c7fb8") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "First-Day Pop Rate by Employee-Count Bucket",
+       x = "Employees at IPO", y = "% of IPOs that popped") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+The relationship with company age ends up being pretty mixed instead of
+clean. The median company that popped was actually a little bit older
+at IPO of being 7 years old than one that didn't pop around 5 years old,
+even though the mean age is actually lower for the ones that popped
+once you average in a handful of really old companies. 
+Employee count is similarly messy since mid-sized companies
+which had 5,001-10,000 employees pop the most unlike the smallest ones that i
+though would. Neither of these variables shows a clean pattern I was
+expecting which I thought was actually useful finding on
+its own. It suggests firm size and age by themselves are pretty weak
+predictors, and whatever signal they do carry probably comes from how the
+model combines them with sector and market conditions instead of from
+either variable alone.
+
+## Pop rate by IPO year and market trend
+
+```{r eda-year, fig.width=7, fig.height=4}
+ipo %>%
+  group_by(ipo_year) %>%
+  summarise(pop_rate = mean(pop == "Pop"), n = n()) %>%
+  ggplot(aes(x = ipo_year, y = pop_rate)) +
+  geom_col(fill = "#2c7fb8") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "First-Day Pop Rate by IPO Year",
+       x = NULL, y = "% of IPOs that popped") +
+  theme_minimal()
+```
+
+There's a big spike right at the peak of the dot-com run-up, with about
+32% of 1999 IPOs and 33% of 2000 IPOs popping compared to roughly 15% in a
+normal year. This is then followed by a sharp drop once the bubble burst under 9% of
+both 1998 and 2002 IPOs popped. Outside of that specific period the
+year-to-year pattern gets a lot noisier so I included the
+continuous `market_*_trend` variables as predictors instead of just
+relying on a rough per-year average. They let the model pick up on market
+conditions in more detail than just "which year did this IPO happen in."
+
+## Correlation among numeric predictors
+
+```{r eda-corr, fig.width=6, fig.height=6}
+ipo_num <- ipo %>%
+  select(year_difference, market_month_trend, market_3month_trend,
+         market_6month_trend, market_year_trend) %>%
+  drop_na()
+
+corrplot(cor(ipo_num), method = "circle", type = "upper",
+          tl.col = "black", tl.srt = 45, addCoef.col = "black")
+```
+
+The four market-trend variables are fairly strongly correlated with each other. 
+Correlations range from about 0.48 (1-month
+vs. 1-year trend) all the way up to 0.90 (6-month vs. 1-year trend), which
+makes sense because a market that was trending up over the past month 
+usually also trends up over the past year. `year_difference` on the
+other hand is basically uncorrelated with all four of them with every
+correlation under 0.02. None of these correlations are strong enough that
+I'm worried about multicollinearity messing up the linear models below.
+
+# Data Splitting and Cross-Validation
+
+Before I fit any models I split the cleaned data into a **training set**
+and a **testing set**. The training set gets used for everything up
+through model selection. I use an 80/20 split that is **stratified** 
+on the outcome variable `pop`. Since "popping" is a fairly rare outcome at about 
+15% of IPOs, a normal random split could easily end up with pretty different 
+pop rates in the training and testing sets just by chance. Stratifying makes 
+sure both sets end up with about the same proportion of pops as the whole dataset.
+
+```{r split}
+set.seed(131)
+ipo_split <- initial_split(ipo, prop = 0.80, strata = pop)
+ipo_train <- training(ipo_split)
+ipo_test  <- testing(ipo_split)
+
+dim(ipo_train)
+dim(ipo_test)
+```
+
+Inside the training set, I use **10-fold cross-validation** to tune and
+compare models before I ever touch the testing set. With k-fold
+cross-validation the training data gets randomly split into k=10
+roughly equal-sized groups called "folds." The model gets fit 10
+separate times, and each time one fold gets held out as a mini validation
+set while the model trains on the other k − 1 folds, then gets scored on
+the fold that was held out. Averaging the performance across all k rounds
+gives a more reliable idea of how well a model generalizes compared to just doing one
+train/validation split. Just like with the initial split, I stratify the folds on 
+`pop` so every fold has a fair share of pops in it.
+
+```{r cv-folds}
+ipo_folds <- vfold_cv(ipo_train, v = 10, strata = pop)
+```
+
+# Recipe
+
+All five models below use the same exact recipe so that any differences in
+performance between them come from the models themselves.
+
+```{r recipe}
+ipo_recipe <- recipe(
+  pop ~ sector + usa_company + employees_grouped + year_difference +
+    ceo_gender + market_month_trend + market_3month_trend +
+    market_6month_trend + market_year_trend,
+  data = ipo_train
+) %>%
+  step_unknown(sector) %>%                    
+  step_impute_median(year_difference) %>%
+  step_novel(sector, usa_company, employees_grouped, ceo_gender) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%                
+  step_normalize(all_numeric_predictors()) %>%
+  step_upsample(pop, over_ratio = 1)           
+
+ipo_baked <- prep(ipo_recipe) %>% bake(new_data = NULL)
+dim(ipo_baked)
+head(ipo_baked)
+```
+
+`step_unknown()` gives the missing `sector` values their own category
+instead of quietly guessing a value for them. `step_impute_median()` fills
+in the roughly 20% of missing `year_difference` values with the training
+set's median company age. `step_novel()` protects against a category
+showing up in a testing fold that was never seen in training.
+`step_dummy()` one-hot encodes the four categorical predictors.
+`step_zv()` gets rid of any dummy columns that end up constant. And
+`step_normalize()` centers and scales the numeric predictors, which
+especially matters for the elastic net model.
+
+**On `step_upsample()`:** I actually tried fitting a random forest both
+with and without this step to see if it was worth including, instead of
+just adding it in because my data memo mentioned it as something I might
+need. Without upsampling, the model's cross-validated ROC AUC was a little
+higher but on the testing set it predicted "No_Pop" for every single
+IPO and correctly caught 0 of the 110 real pops in the testing set. This
+happened because so few training examples were labeled "Pop" that the
+model never actually learned to push any predicted probability above the
+default 0.5 cutoff. With `step_upsample()` duplicating the "Pop" rows in the
+training data until the two classes are balanced the ROC AUC barely changed
+but the model actually started catching a decent chunk of real pops
+around a fourth of them. `step_upsample()`only used the training data 
+inside each resample so the testing set and each validation fold stay at their 
+real proportions. This means it isn't inflating the performance numbers instead
+it's just giving the model an actual chance to learn what the minority class looks like.
+
+# Model Fitting
+
+I fit and tuned five different classification model types on the same
+folds using logistic regression and LDA as the simple baselines. Then used 
+elastic net logistic regression, random forest, and boosted tree as the more
+flexible options. I used ROC AUC as my main comparison metric
+since it looks at how the model ranks predicted probabilities
+across every possible classification threshold and it's a lot less
+sensitive to class imbalance than plain accuracy is. That matters a lot
+here since only about 15% of IPOs actually pop.
+
+```{r check-cache}
+models_file <- "data/ipo_tuned_models.rda"
+models_cached <- file.exists(models_file)
+if (models_cached) load(models_file)
+```
+## Baseline: Logistic Regression
+
+```{r log-reg, eval=!models_cached}
+log_mod <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_wflow <- workflow() %>%
+  add_model(log_mod) %>%
+  add_recipe(ipo_recipe)
+
+log_res <- fit_resamples(
+  log_wflow,
+  resamples = ipo_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+## Baseline: Linear Discriminant Analysis
+
+```{r lda, eval=!models_cached}
+lda_mod <- discrim_linear() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+
+lda_wflow <- workflow() %>%
+  add_model(lda_mod) %>%
+  add_recipe(ipo_recipe)
+
+lda_res <- fit_resamples(
+  lda_wflow,
+  resamples = ipo_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+## Elastic Net Logistic Regression
+
+```{r elastic-net-setup}
+en_mod <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+en_wflow <- workflow() %>%
+  add_model(en_mod) %>%
+  add_recipe(ipo_recipe)
+
+en_grid <- grid_regular(
+  penalty(range = c(-4, 0)),   # log10 scale, so 0.0001 to 1
+  mixture(range = c(0, 1)),
+  levels = 10
+)
+```
+
+```{r compute faster}
+set.seed(131)
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+```
+
+
+```{r elastic-net-tune, eval=!models_cached}
+en_tune <- tune_grid(
+  en_wflow,
+  resamples = ipo_folds,
+  grid = en_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+autoplot(en_tune)
+```
+
+## Random Forest
+
+```{r rf-setup}
+rf_mod <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wflow <- workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(ipo_recipe)
+
+# The recipe produces 29 predictor columns after dummy-coding (12 sector
+# dummies + 2 usa_company + 6 employees_grouped + 4 ceo_gender + 5 numeric;
+# confirmed with ncol(ipo_baked) - 1 above) so mtry can safely range up to the high teens.
+rf_grid <- grid_regular(
+  mtry(range = c(1, 15)),
+  trees(range = c(200, 1000)),
+  min_n(range = c(2, 20)),
+  levels = 5
+)
+```
+
+```{r rf-tune, eval=!models_cached}
+rf_tune <- tune_grid(
+  rf_wflow,
+  resamples = ipo_folds,
+  grid = rf_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+autoplot(rf_tune)
+```
+
+```{r rf-tune shutdown}
+stopCluster(cl)
+registerDoSEQ()
+```
+
+## Boosted Tree
+
+```{r bt-setup}
+bt_mod <- boost_tree(trees = tune(), tree_depth = tune(), learn_rate = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+bt_wflow <- workflow() %>%
+  add_model(bt_mod) %>%
+  add_recipe(ipo_recipe)
+
+bt_grid <- grid_regular(
+  trees(range = c(100, 1000)),
+  tree_depth(range = c(1, 10)),
+  learn_rate(range = c(-3, -0.5)),
+  levels = 4
+)
+```
+
+```{r bt-tune, eval=!models_cached}
+bt_tune <- tune_grid(
+  bt_wflow,
+  resamples = ipo_folds,
+  grid = bt_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+autoplot(bt_tune)
+```
+
+```{r save-models, eval=!models_cached}
+save(log_res, lda_res, en_tune, rf_tune, bt_tune,
+     file = "data/ipo_tuned_models.rda")
+```
+
+# Model Selection
+
+```{r compare-models}
+best_log <- collect_metrics(log_res) %>% filter(.metric == "roc_auc") %>%
+  mutate(model = "Logistic Regression")
+best_lda <- collect_metrics(lda_res) %>% filter(.metric == "roc_auc") %>%
+  mutate(model = "LDA")
+best_en  <- show_best(en_tune, metric = "roc_auc", n = 1) %>% mutate(model = "Elastic Net")
+best_rf  <- show_best(rf_tune, metric = "roc_auc", n = 1) %>% mutate(model = "Random Forest")
+best_bt  <- show_best(bt_tune, metric = "roc_auc", n = 1) %>% mutate(model = "Boosted Tree")
+
+model_comparison <- bind_rows(best_log, best_lda, best_en, best_rf, best_bt) %>%
+  select(model, mean, std_err) %>%
+  arrange(desc(mean))
+
+model_comparison
+```
+
+```{r compare-plot, fig.width=6, fig.height=4}
+ggplot(model_comparison, aes(x = fct_reorder(model, mean), y = mean)) +
+  geom_col(fill = "#2c7fb8") +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), width = 0.2) +
+  coord_flip() +
+  labs(title = "Cross-Validated ROC AUC by Model Type",
+       x = NULL, y = "Mean ROC AUC (10-fold CV)") +
+  theme_minimal()
+```
+
+
+```{r finalize}
+best_params <- select_best(rf_tune, metric = "roc_auc")
+final_wflow <- finalize_workflow(rf_wflow, best_params)
+final_fit   <- fit(final_wflow, data = ipo_train)
+```
+
+## Variable importance
+
+```{r vip, fig.width=6, fig.height=4}
+vi_scores <- final_fit %>% extract_fit_parsnip() %>% vip::vi()
+vi_scores
+
+ggplot(vi_scores, aes(x = fct_reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#2c7fb8", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Variable Importance, Final Model", x = NULL)
+```
+
+# Performance on the Testing Set
+
+```{r test-performance}
+ipo_test_res <- augment(final_fit, new_data = ipo_test)
+
+test_roc_auc <- roc_auc(ipo_test_res, truth = pop, .pred_Pop)
+test_acc     <- accuracy(ipo_test_res, truth = pop, estimate = .pred_class)
+
+bind_rows(test_roc_auc, test_acc)
+```
+
+```{r test-roc-curve, fig.width=5, fig.height=5}
+roc_curve(ipo_test_res, truth = pop, .pred_Pop) %>%
+  autoplot() +
+  labs(title = "ROC Curve, Final Model (Testing Data)")
+```
+
+```{r test-confusion, fig.width=5, fig.height=4}
+conf_mat(ipo_test_res, truth = pop, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title = "Confusion Matrix, Final Model (Testing Data)")
+```
+
+I compare `test_roc_auc` above to the mean cross-validated ROC AUC for the
+same model in `model_comparison`. If the two numbers are close together
+that's good evidence the cross-validation actually gave an honest estimate
+of how the model generalizes. If the testing ROC AUC is noticeably lower,
+that suggests some overfitting to the training folds. If it's noticeably
+higher, that's most likely just because the testing set is relatively
+small, not because the model is actually better than what CV suggested.
+
+# Conclusion
+
+From the five models I fit, the cross-validated ROC AUC clustered pretty tightly
+in the 0.69-0.71 range no matter which model type I used. Random Forest ended up 
+barely on top with a cross-validated ROC AUC of 0.710, just barely beating the 
+boosted tree (0.703). The elastic net, LDA, and logistic regression were close behind 
+at 0.693, 0.691, and 0.689. On the testing set, the final random forest scored a ROC AUC 
+of 0.696 and an accuracy of 0.765 which is close to its 0.710 CV estimate. So 
+cross-validation gave a pretty honest read on how the model would actually generalize. 
+I think the fact that a simple logistic regression does almost as well as a tuned random forest 
+is actually pretty interesting. It shows that the signal in this data is fairly linear
+and additive instead of being driven by complicated interactions between predictors.
+So the more flexible models don't really have much of an advantage here.
+
+The variable importance plot is actually pretty important here. `year_difference`
+and the four market-trend variables took the top five importance spots whcih were
+all clustered pretty close together roughly 154 to 168. `sector_unknown` 
+which was basically whether sector was actually missing for a given IPO came in
+6th place at 112.8 This was a real drop from the top five, but still way ahead of 
+every actual named sector like employee-count bucket or CEO-gender category.
+This shows that market timing and company age matter the most but simply not having
+a sector on record for a company is still a surprisingly strong signal on its own. 
+Lookibg back at the sector EDA plot, IPOs with an unrecorded sector only popped 
+about 1% of the time compared to roughly 15% overall. So the "we don't have this 
+company's basic info" is a genuinely strong signal by itself.This is probably because 
+the same smaller abd lower-profile listings that never got fully documented are 
+also the ones least likely to get investors as interested on release day which makes sense.
+
+With this the model is definitely far from perfect which I don't think that's really surprising.
+Whether an IPO pops on its first day is driven by a lot of other uncalculated variables like 
+investor sentiment, news about the similar stocks in the sector, and how the 
+underwriters behave in the days leading up to the IPO. These numbers were not calculated
+in this dataset and can drive the IPO's value. I think a model with a moderate 
+but real ROC AUC is basically the expected outcome for a problem noisy modeling approach.
+
+The class imbalance ended up mattering a lot here. My final model's confusion matrix 
+on the testing set caught 40 of the 110 real pops and missed 70.It also had 97 false positives
+giving an overall accuracy of 76.5%. That recall wouldn't have happened without step_upsample()
+in the recipe with only about 15% of training rows labeled "Pop," Upsampling forces 
+the model to actually learn the minority class during training, which is exactly why 
+I leaned on ROC AUC and not accuracy to pick the model in the first place.
+
+In the future I think the best steps would be adding more features instead of trying even more model types.
+The raw file actually has hundreds of pre-IPO financial-statement line items like 
+revenue, net income, total assets and more that I left out here because they're extremely
+specific to certain industries. Building a version of this model around just a handful of these
+especially total revenue and net income the year before IPO would be the next thing to try. 
+I also think fitting the model to more specfic sectors which would make these predictors
+more useful. Also training the model for more specfic IPO's like health would make these models
+more accurate. 
+
+In conclusion, calculating if an IPO would "pop" or not is a very hard thing to model since
+it is so noisy. If it was this easy to calculate every big prop firm would do it. 
+I think this was a very interesting project to do really showing how much goes into predicting stock
+direction which is why big firms pay so much and why quants make so much. In the end
+it was a fun model to train even though the recall rate was only 36.4% and 29.2% precision
+with a ROC of ~0.7, which wouldn't be actually used to find if an IPO would "pop" or not.
+
+
+
+
+
+
